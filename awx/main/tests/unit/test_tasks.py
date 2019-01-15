@@ -2068,12 +2068,14 @@ class TestInventoryUpdateCredentials(TestJobExecution):
 
             return ['successful', 0]
 
-        self.run_pexpect.side_effect = run_pexpect_side_effect
-        self.task.run(self.pk)
+        # Change the initial version of the inventory plugin to force use of script
+        with mock.patch('awx.main.models.inventory.gce.initial_version', None):
+            self.run_pexpect.side_effect = run_pexpect_side_effect
+            self.task.run(self.pk)
 
-        self.instance.source_regions = 'us-east-4'
-        expected_gce_zone = 'us-east-4'
-        self.task.run(self.pk)
+            self.instance.source_regions = 'us-east-4'
+            expected_gce_zone = 'us-east-4'
+            self.task.run(self.pk)
 
     def test_openstack_source(self):
         openstack = CredentialType.defaults['openstack']()
