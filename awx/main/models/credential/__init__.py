@@ -4,6 +4,7 @@ from collections import OrderedDict
 import functools
 import logging
 import os
+from pkg_resources import iter_entry_points
 import re
 import stat
 import tempfile
@@ -35,9 +36,10 @@ from awx.main.utils import encrypt_field
 from awx.main.constants import CHOICES_PRIVILEGE_ESCALATION_METHODS
 from . import injectors as builtin_injectors
 
-__all__ = ['Credential', 'CredentialType', 'V1Credential', 'build_safe_env']
+__all__ = ['Credential', 'CredentialType', 'CredentialInputSource', 'V1Credential', 'build_safe_env']
 
 logger = logging.getLogger('awx.main.models.credential')
+credential_plugins = [ep.load() for ep in iter_entry_points('awx.credential_plugins')]
 
 HIDDEN_PASSWORD = '**********'
 
@@ -221,7 +223,6 @@ class V1Credential(object):
     }
 
 
-
 class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
     '''
     A credential contains information about how to talk to a remote resource
@@ -275,6 +276,10 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
         'use_role',
         'admin_role',
     ])
+
+    def __init__(self, *args, **kwargs):
+        super(Credential, self).__init__(*args, **kwargs)
+        self.dynamic_input_fields = self._get_dynamic_input_field_names()
 
     def __getattr__(self, item):
         if item != 'inputs':
@@ -442,6 +447,8 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
         :param field_name(str):        The name of the input field.
         :param default(optional[str]): A default return value to use.
         """
+        if field_name in self.dynamic_input_fields:
+            return self._get_dynamic_input(field_name)
         if field_name in self.credential_type.secret_fields:
             try:
                 return decrypt_field(self, field_name)
@@ -456,7 +463,17 @@ class Credential(PasswordFieldsModel, CommonModelNameNotUnique, ResourceMixin):
         raise AttributeError(field_name)
 
     def has_input(self, field_name):
+        if field_name in self.dynamic_input_fields:
+            return True
         return field_name in self.inputs and self.inputs[field_name] not in ('', None)
+
+    def _get_dynamic_input_field_names(self):
+        input_sources = CredentialInputSource.objects.filter(target_credential=self)
+        return [obj.input_field_name for obj in input_sources]
+
+    def _get_dynamic_input(self, field_name):
+        input_sources = CredentialInputSource.objects.filter(target_credential=self)
+        return input_sources.filter(input_field_name=field_name).first().get_input_value()
 
 
 class CredentialType(CommonModelNameNotUnique):
@@ -481,6 +498,7 @@ class CredentialType(CommonModelNameNotUnique):
         ('scm', _('Source Control')),
         ('cloud', _('Cloud')),
         ('insights', _('Insights')),
+        ('external', _('External')),
     )
 
     kind = models.CharField(
@@ -558,6 +576,17 @@ class CredentialType(CommonModelNameNotUnique):
                     "adding %s credential type" % default_.name
                 ))
                 default_.save()
+
+    @classmethod
+    def load_plugin(cls, plugin):
+        def wrapper(cls):
+            return cls(
+                kind='external',
+                managed_by_tower=True,
+                name=plugin.name,
+                inputs=plugin.inputs
+            )
+        cls.defaults[plugin.name.lower()] = functools.partial(wrapper, cls)
 
     @classmethod
     def from_v1_kind(cls, kind, data={}):
@@ -1227,3 +1256,45 @@ def tower(cls):
             }
         },
     )
+
+
+class CredentialInputSource(PrimordialModel):
+
+    class Meta:
+        app_label = 'main'
+        unique_together = (('target_credential', 'input_field_name'),)
+
+    target_credential = models.ForeignKey(
+        'Credential',
+        related_name='input_source',
+        on_delete=models.CASCADE,
+        null=True,
+    )
+    source_credential = models.ForeignKey(
+        'Credential',
+        related_name='target_input_source',
+        on_delete=models.CASCADE,
+        null=True,
+    )
+    input_field_name = models.CharField(
+        max_length=1024,
+        default=False,
+        editable=False,
+    )
+
+    def get_input_value(self):
+        plugin_name = self.source_credential.credential_type.name
+        [backend] = [p.backend for p in credential_plugins if p.name == plugin_name]
+
+        backend_kwargs = {}
+        for field_name, value in self.source_credential.inputs.items():
+            if field_name in self.source_credential.credential_type.secret_fields:
+                backend_kwargs[field_name] = decrypt_field(self.source_credential, field_name)
+            else:
+                backend_kwargs[field_name] = value
+
+        return backend(**backend_kwargs)
+
+
+for plugin in credential_plugins:
+    CredentialType.load_plugin(plugin)
