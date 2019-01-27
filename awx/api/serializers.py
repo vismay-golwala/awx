@@ -2768,6 +2768,20 @@ class CredentialSerializerCreate(CredentialSerializer):
                 value = validated_data.pop(attr)
                 if value:
                     validated_data['inputs'][attr] = value
+
+        # XXX - Temporary hack for dev and demonstration purposes
+        # Enter '_plugin(credential_name)' into an input field when saving a new credential
+        # in the UI to link that field to an input source credential.
+        source_credentials = {}
+        for key in validated_data['inputs']:
+            if validated_data['inputs'][key].startswith('_plugin'):
+                source_name = validated_data['inputs'][key]
+                source_name = source_name.replace('_plugin', '')
+                source_name = source_name.replace('(', '')
+                source_name = source_name.replace(')', '')
+                source_credentials[key] = Credential.objects.filter(name=source_name).first()
+                validated_data['inputs'][key] = ''
+
         credential = super(CredentialSerializerCreate, self).create(validated_data)
 
         if user:
@@ -2777,6 +2791,14 @@ class CredentialSerializerCreate(CredentialSerializer):
                 raise serializers.ValidationError({"detail": _("Credential organization must be set and match before assigning to a team")})
             credential.admin_role.parents.add(team.admin_role)
             credential.use_role.parents.add(team.member_role)
+
+        for key, source in source_credentials.items():
+            CredentialInputSource.objects.create(
+                source_credential=source,
+                target_credential=credential,
+                input_field_name=key,
+            )
+
         return credential
 
 
